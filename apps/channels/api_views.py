@@ -8,8 +8,10 @@ from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from django.shortcuts import get_object_or_404, get_list_or_404
 from django.db import transaction
+from django.db.models import Count, F
 from django.db.models import Q
-import os, json, requests, logging
+import os, json, requests, logging, mimetypes
+from django.utils.http import http_date
 from urllib.parse import unquote
 from apps.accounts.permissions import (
     Authenticated,
@@ -96,7 +98,7 @@ class StreamFilter(django_filters.FilterSet):
     channel_group_name = OrInFilter(
         field_name="channel_group__name", lookup_expr="icontains"
     )
-    m3u_account = django_filters.NumberFilter(field_name="m3u_account__id")
+    m3u_account = django_filters.BaseInFilter(field_name="m3u_account__id")
     m3u_account_name = django_filters.CharFilter(
         field_name="m3u_account__name", lookup_expr="icontains"
     )
@@ -147,13 +149,19 @@ class StreamViewSet(viewsets.ModelViewSet):
             qs = qs.filter(channels__id=assigned)
 
         unassigned = self.request.query_params.get("unassigned")
-        if unassigned == "1":
-            qs = qs.filter(channels__isnull=True)
+        if unassigned and str(unassigned).lower() in ("1", "true", "yes", "on"):
+            # Use annotation with Count for better performance on large datasets
+            qs = qs.annotate(channel_count=Count('channels')).filter(channel_count=0)
 
         channel_group = self.request.query_params.get("channel_group")
         if channel_group:
             group_names = channel_group.split(",")
             qs = qs.filter(channel_group__name__in=group_names)
+
+        # Allow client to hide stale streams (streams marked as is_stale=True)
+        hide_stale = self.request.query_params.get("hide_stale")
+        if hide_stale and str(hide_stale).lower() in ("1", "true", "yes", "on"):
+            qs = qs.filter(is_stale=False)
 
         return qs
 
@@ -193,6 +201,73 @@ class StreamViewSet(viewsets.ModelViewSet):
 
         # Return the response with the list of unique group names
         return Response(list(group_names))
+
+    @action(detail=False, methods=["get"], url_path="filter-options")
+    def get_filter_options(self, request, *args, **kwargs):
+        """
+        Get available filter options based on current filter state.
+        Uses a hierarchical approach: M3U is the parent filter, Group filters based on M3U.
+        """
+        # For group options: we need to bypass the channel_group custom queryset filtering
+        # Store original request params
+        original_params = request.query_params
+
+        # Create modified params without channel_group for getting group options
+        params_without_group = request.GET.copy()
+        params_without_group.pop('channel_group', None)
+        params_without_group.pop('channel_group_name', None)
+
+        # Temporarily modify request to exclude channel_group
+        request._request.GET = params_without_group
+        base_queryset_for_groups = self.get_queryset()
+
+        # Apply filterset (which will apply M3U filters)
+        group_filterset = self.filterset_class(
+            params_without_group,
+            queryset=base_queryset_for_groups
+        )
+        group_queryset = group_filterset.qs
+
+        group_names = (
+            group_queryset.exclude(channel_group__isnull=True)
+            .order_by("channel_group__name")
+            .values_list("channel_group__name", flat=True)
+            .distinct()
+        )
+
+        # For M3U options: show ALL M3Us (don't filter by anything except name search)
+        params_for_m3u = request.GET.copy()
+        params_for_m3u.pop('m3u_account', None)
+        params_for_m3u.pop('channel_group', None)
+        params_for_m3u.pop('channel_group_name', None)
+
+        # Temporarily modify request to exclude filters for M3U options
+        request._request.GET = params_for_m3u
+        base_queryset_for_m3u = self.get_queryset()
+
+        m3u_filterset = self.filterset_class(
+            params_for_m3u,
+            queryset=base_queryset_for_m3u
+        )
+        m3u_queryset = m3u_filterset.qs
+
+        m3u_accounts = (
+            m3u_queryset.exclude(m3u_account__isnull=True)
+            .order_by("m3u_account__name")
+            .values("m3u_account__id", "m3u_account__name")
+            .distinct()
+        )
+
+        # Restore original params
+        request._request.GET = original_params
+
+        return Response({
+            "groups": list(group_names),
+            "m3u_accounts": [
+                {"id": m3u["m3u_account__id"], "name": m3u["m3u_account__name"]}
+                for m3u in m3u_accounts
+            ]
+        })
 
     @swagger_auto_schema(
         method="post",
@@ -518,6 +593,10 @@ class ChannelViewSet(viewsets.ModelViewSet):
 
         if self.request.user.user_level < 10:
             filters["user_level__lte"] = self.request.user.user_level
+            # Hide adult content if user preference is set
+            custom_props = self.request.user.custom_properties or {}
+            if custom_props.get('hide_adult_content', False):
+                filters["is_adult"] = False
 
         if filters:
             qs = qs.filter(**filters)
@@ -880,6 +959,7 @@ class ChannelViewSet(viewsets.ModelViewSet):
             "tvg_id": stream.tvg_id,
             "tvc_guide_stationid": tvc_guide_stationid,
             "streams": [stream_id],
+            "is_adult": stream.is_adult,
         }
 
         # Only add channel_group_id if the stream has a channel group
@@ -1170,6 +1250,95 @@ class ChannelViewSet(viewsets.ModelViewSet):
             )
         except Exception as e:
             return Response({"error": str(e)}, status=400)
+
+    @swagger_auto_schema(
+        method="post",
+        operation_description=(
+            "Reorder a channel by moving it after another channel (or to the start if insert_after_id is null). "
+            "The channel will receive the next whole number after the target channel, and all subsequent "
+            "channels will be renumbered accordingly."
+        ),
+        request_body=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            properties={
+                "insert_after_id": openapi.Schema(
+                    type=openapi.TYPE_INTEGER,
+                    description="ID of the channel to insert after. Use null to move to the beginning.",
+                    nullable=True,
+                ),
+            },
+        ),
+        responses={
+            200: "Channel reordered successfully",
+            404: "Channel not found",
+            400: "Invalid request",
+        },
+    )
+    @action(detail=True, methods=["post"], url_path="reorder")
+    def reorder(self, request, pk=None):
+        """
+        Reorder a channel by moving it after another channel (or to the start if insert_after_id is null).
+        Shifts other channels as needed to maintain contiguous ordering.
+        """
+        channel = self.get_object()
+        insert_after_id = request.data.get("insert_after_id")
+        old_channel_number = channel.channel_number
+
+        with transaction.atomic():
+            if insert_after_id is None:
+                # Move to the beginning (channel_number = 1)
+                target_number = 0
+                desired_number = 1
+            else:
+                try:
+                    target_channel = Channel.objects.get(id=insert_after_id)
+                    target_number = target_channel.channel_number or 0
+                    desired_number = int(target_number) + 1
+                except Channel.DoesNotExist:
+                    return Response(
+                        {"error": "Target channel not found"},
+                        status=status.HTTP_404_NOT_FOUND,
+                    )
+
+            if desired_number == old_channel_number:
+                # No change needed
+                return Response(
+                    {
+                        "message": f"Channel {channel.name} already at position {desired_number}",
+                        "channel": self.get_serializer(channel).data,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+            if desired_number < old_channel_number:
+                # Moving up: increment all channels between desired_number and old_channel_number-1
+                Channel.objects.filter(
+                    channel_number__gte=desired_number,
+                    channel_number__lt=old_channel_number
+                ).update(channel_number=F('channel_number') + 1)
+                channel.channel_number = desired_number
+                channel.save(update_fields=['channel_number'])
+            elif desired_number > old_channel_number:
+                # Moving down: shift down channels between old+1 and desired-1, then set to desired-1
+                if desired_number > old_channel_number + 1:
+                    Channel.objects.filter(
+                        channel_number__gt=old_channel_number,
+                        channel_number__lt=desired_number
+                    ).update(channel_number=F('channel_number') - 1)
+                channel.channel_number = desired_number - 1
+                channel.save(update_fields=['channel_number'])
+            else:
+                # No move or same position
+                channel.channel_number = desired_number
+                channel.save(update_fields=['channel_number'])
+
+        return Response(
+            {
+                "message": f"Channel {channel.name} moved to position {desired_number}",
+                "channel": self.get_serializer(channel).data,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @swagger_auto_schema(
         method="post",
@@ -1653,11 +1822,10 @@ class LogoViewSet(viewsets.ModelViewSet):
         """Streams the logo file, whether it's local or remote."""
         logo = self.get_object()
         logo_url = logo.url
-
         if logo_url.startswith("/data"):  # Local file
             if not os.path.exists(logo_url):
                 raise Http404("Image not found")
-
+            stat = os.stat(logo_url)
             # Get proper mime type (first item of the tuple)
             content_type, _ = mimetypes.guess_type(logo_url)
             if not content_type:
@@ -1667,6 +1835,8 @@ class LogoViewSet(viewsets.ModelViewSet):
             response = StreamingHttpResponse(
                 open(logo_url, "rb"), content_type=content_type
             )
+            response["Cache-Control"] = "public, max-age=14400"  # Cache in browser for 4 hours
+            response["Last-Modified"] = http_date(stat.st_mtime)
             response["Content-Disposition"] = 'inline; filename="{}"'.format(
                 os.path.basename(logo_url)
             )
@@ -1706,6 +1876,10 @@ class LogoViewSet(viewsets.ModelViewSet):
                         remote_response.iter_content(chunk_size=8192),
                         content_type=content_type,
                     )
+                    if(remote_response.headers.get("Cache-Control")):
+                        response["Cache-Control"] = remote_response.headers.get("Cache-Control")
+                    if(remote_response.headers.get("Last-Modified")):
+                        response["Last-Modified"] = remote_response.headers.get("Last-Modified")
                     response["Content-Disposition"] = 'inline; filename="{}"'.format(
                         os.path.basename(logo_url)
                     )
@@ -2232,9 +2406,72 @@ class SeriesRulesAPIView(APIView):
         except KeyError:
             return [Authenticated()]
 
+    @swagger_auto_schema(
+        operation_summary="List all series rules",
+        operation_description="Retrieve all configured DVR series recording rules.",
+        responses={
+            200: openapi.Response(
+                description="List of series rules",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'rules': openapi.Schema(
+                            type=openapi.TYPE_ARRAY,
+                            items=openapi.Schema(
+                                type=openapi.TYPE_OBJECT,
+                                properties={
+                                    'tvg_id': openapi.Schema(type=openapi.TYPE_STRING, description='Channel TVG ID'),
+                                    'mode': openapi.Schema(type=openapi.TYPE_STRING, enum=['all', 'new'], description='Recording mode: all episodes or new only'),
+                                    'title': openapi.Schema(type=openapi.TYPE_STRING, description='Series title'),
+                                },
+                            ),
+                            description='List of series recording rules'
+                        ),
+                    },
+                ),
+            ),
+        },
+    )
     def get(self, request):
         return Response({"rules": CoreSettings.get_dvr_series_rules()})
 
+    @swagger_auto_schema(
+        operation_summary="Create or update a series rule",
+        operation_description="Add a new series recording rule or update an existing one. Rules will be evaluated immediately to find matching episodes.",
+        request_body=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            required=['tvg_id'],
+            properties={
+                'tvg_id': openapi.Schema(type=openapi.TYPE_STRING, description='Channel TVG ID'),
+                'mode': openapi.Schema(type=openapi.TYPE_STRING, enum=['all', 'new'], default='all', description='all: record all episodes, new: record only new episodes'),
+                'title': openapi.Schema(type=openapi.TYPE_STRING, description='Series title'),
+            },
+        ),
+        responses={
+            200: openapi.Response(
+                description="Series rule created/updated successfully",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'success': openapi.Schema(type=openapi.TYPE_BOOLEAN),
+                        'rules': openapi.Schema(
+                            type=openapi.TYPE_ARRAY,
+                            items=openapi.Schema(
+                                type=openapi.TYPE_OBJECT,
+                                properties={
+                                    'tvg_id': openapi.Schema(type=openapi.TYPE_STRING),
+                                    'mode': openapi.Schema(type=openapi.TYPE_STRING),
+                                    'title': openapi.Schema(type=openapi.TYPE_STRING),
+                                },
+                            ),
+                            description='Updated list of all rules'
+                        ),
+                    },
+                ),
+            ),
+            400: openapi.Response(description="Bad request (missing tvg_id or invalid mode)"),
+        },
+    )
     def post(self, request):
         data = request.data or {}
         tvg_id = str(data.get("tvg_id") or "").strip()
@@ -2267,6 +2504,36 @@ class DeleteSeriesRuleAPIView(APIView):
         except KeyError:
             return [Authenticated()]
 
+    @swagger_auto_schema(
+        operation_summary="Delete a series rule",
+        operation_description="Remove a series recording rule by TVG ID. This does not remove already scheduled recordings.",
+        manual_parameters=[
+            openapi.Parameter('tvg_id', openapi.IN_PATH, type=openapi.TYPE_STRING, required=True, description='Channel TVG ID'),
+        ],
+        responses={
+            200: openapi.Response(
+                description="Series rule deleted successfully",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'success': openapi.Schema(type=openapi.TYPE_BOOLEAN),
+                        'rules': openapi.Schema(
+                            type=openapi.TYPE_ARRAY,
+                            items=openapi.Schema(
+                                type=openapi.TYPE_OBJECT,
+                                properties={
+                                    'tvg_id': openapi.Schema(type=openapi.TYPE_STRING),
+                                    'mode': openapi.Schema(type=openapi.TYPE_STRING),
+                                    'title': openapi.Schema(type=openapi.TYPE_STRING),
+                                },
+                            ),
+                            description='Updated list of all rules'
+                        ),
+                    },
+                ),
+            ),
+        },
+    )
     def delete(self, request, tvg_id):
         tvg_id = unquote(str(tvg_id or ""))
         rules = [r for r in CoreSettings.get_dvr_series_rules() if str(r.get("tvg_id")) != tvg_id]
@@ -2281,6 +2548,27 @@ class EvaluateSeriesRulesAPIView(APIView):
         except KeyError:
             return [Authenticated()]
 
+    @swagger_auto_schema(
+        operation_summary="Evaluate series rules",
+        operation_description="Trigger evaluation of series recording rules to find and schedule matching episodes. Can evaluate all rules or a specific channel.",
+        request_body=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            properties={
+                'tvg_id': openapi.Schema(type=openapi.TYPE_STRING, description='Optional: evaluate only rules for this channel TVG ID. If omitted, all rules are evaluated.'),
+            },
+        ),
+        responses={
+            200: openapi.Response(
+                description="Evaluation completed successfully",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'success': openapi.Schema(type=openapi.TYPE_BOOLEAN),
+                    },
+                ),
+            ),
+        },
+    )
     def post(self, request):
         tvg_id = request.data.get("tvg_id")
         # Run synchronously so UI sees results immediately
@@ -2302,6 +2590,32 @@ class BulkRemoveSeriesRecordingsAPIView(APIView):
         except KeyError:
             return [Authenticated()]
 
+    @swagger_auto_schema(
+        operation_summary="Bulk remove scheduled recordings for a series",
+        operation_description="Delete future scheduled recordings for a series rule. Useful for stopping a rule without losing the configuration. Matches by channel and optionally by series title.",
+        request_body=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            required=['tvg_id'],
+            properties={
+                'tvg_id': openapi.Schema(type=openapi.TYPE_STRING, description='Channel TVG ID (required)'),
+                'title': openapi.Schema(type=openapi.TYPE_STRING, description='Series title - when scope=title, only recordings matching this title are removed'),
+                'scope': openapi.Schema(type=openapi.TYPE_STRING, enum=['title', 'channel'], default='title', description='title: remove only matching title on channel, channel: remove all future recordings on channel'),
+            },
+        ),
+        responses={
+            200: openapi.Response(
+                description="Recordings removed successfully",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'success': openapi.Schema(type=openapi.TYPE_BOOLEAN),
+                        'removed': openapi.Schema(type=openapi.TYPE_INTEGER, description='Number of recordings deleted'),
+                    },
+                ),
+            ),
+            400: openapi.Response(description="Bad request (missing tvg_id)"),
+        },
+    )
     def post(self, request):
         from django.utils import timezone
         tvg_id = str(request.data.get("tvg_id") or "").strip()
